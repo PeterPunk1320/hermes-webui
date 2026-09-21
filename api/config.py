@@ -11175,7 +11175,7 @@ DEFERRED_PROCESS_WAKEUPS_LOCK = threading.Lock()
 # subscribers-empty grace path (60s) handles ordinary tab-close traffic.
 SESSION_CHANNEL_IDLE_TTL_SECS: int = 14400  # 4 hours
 SESSION_CHANNEL_SUBSCRIBER_GRACE_SECS: int = 60  # subscribers-empty grace
-# PR #7302 v2 — positive dead-subscriber signal. How long a subscriber's queue
+# Positive dead-subscriber signal. How long a subscriber's queue
 # must reject broadcasts CONTINUOUSLY before the reaper may treat it as dead
 # (a ghost/half-open tab that never drains). A healthy tab drains on every
 # event, so it can never accumulate a run this long; 300s is well above the

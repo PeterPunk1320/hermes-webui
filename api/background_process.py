@@ -137,7 +137,7 @@ class SessionChannel:
         self.created_at = now
         self.last_event_at = now
         self.last_subscriber_drop_at: float | None = None
-        # Explicit-close protocol (PR #7302 v2). ``_closed`` latches once
+        # Explicit-close protocol (#7302). ``_closed`` latches once
         # ``close()`` has signalled every subscriber, so the registry entry is
         # collectible on the next reaper tick and a late ``subscribe()`` can be
         # told to reconnect immediately instead of hanging on keepalives.
@@ -210,7 +210,7 @@ class SessionChannel:
                 # using a small ring-buffer in static/messages.js — see the
                 # bg_task_complete consumer-side dedupe introduced in PR #2971).
                 #
-                # PR #7302 v2: record the START of the stall run. If this queue
+                # Record the START of the stall run. If this queue
                 # keeps rejecting for the whole stall window it becomes positive
                 # evidence that the subscriber is dead rather than merely slow,
                 # which is the only signal allowed to evict a subscribed channel.
@@ -231,7 +231,7 @@ class SessionChannel:
         keepalives forever, and the tab is stranded on an orphaned channel that
         receives no further events.
 
-        Contract (PR #7302 review, point 2):
+        Contract:
           1. Latch ``_closed`` and detach all subscribers under ``self._lock``
              (lock order: ``SESSION_CHANNELS_LOCK`` -> ``self._lock``, the same
              order ``subscribe_to_session_channel`` documents).
@@ -594,7 +594,7 @@ def _reaper_loop() -> None:
             with SESSION_CHANNELS_LOCK:
                 for sid, ch in list(SESSION_CHANNELS.items()):
                     if ch.reaper_should_collect(now):
-                        # Explicit-close protocol (PR #7302 review, point 2):
+                        # Explicit-close protocol (#7302):
                         # signal every still-attached subscriber BEFORE detaching
                         # the registry entry, otherwise the live SSE handler keeps
                         # looping on keepalives forever and the tab is stranded on
