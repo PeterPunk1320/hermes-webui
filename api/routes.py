@@ -21731,6 +21731,25 @@ def _handle_session_sse_stream(handler, parsed):
                 handler.wfile.flush()
                 continue
             if payload is None:
+                # End-of-stream sentinel: the channel was deliberately closed
+                # (SessionChannel.close(), reaper or owner). Simply returning here
+                # does NOT end the response: under HTTP/1.1 keep-alive, with no
+                # Content-Length and no chunked framing, the server keeps the
+                # socket open, the browser's EventSource never sees EOF and stays
+                # attached to a channel the reaper already removed -- silently
+                # missing every later event (the "tab stops receiving updates"
+                # defect this change fixes). Flag the socket so the server closes
+                # it after this handler returns and the client reconnects onto the
+                # replacement channel. The #3103 note still holds: never advertise
+                # `Connection: close` up front (reconnect storms); this applies
+                # only to a deliberate end-of-channel.
+                try:
+                    handler.close_connection = True
+                except Exception:
+                    logger.debug(
+                        "session-stream: could not flag socket close for %s", sid,
+                        exc_info=True,
+                    )
                 break
             event_name, data = payload
             _sse(handler, event_name, data)

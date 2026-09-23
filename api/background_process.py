@@ -249,15 +249,32 @@ class SessionChannel:
         Returns the number of subscribers that received the sentinel.
         """
         with self._lock:
-            if self._closed:
+            subs = self._latch_close_locked(reason)
+            if subs is None:
                 return 0
-            self._closed = True
-            self.closed_at = time.time()
-            self.close_reason = reason or "close"
-            subs = list(self._subscribers)
-            self._subscribers.clear()
-            self._stalled_since.clear()
 
+        return self._signal_close_sentinels(subs)
+
+    def _latch_close_locked(self, reason: str):
+        """Latch ``_closed`` and detach every subscriber; caller holds ``self._lock``.
+
+        Returns the detached queues, or ``None`` when the channel was already
+        closed (idempotent no-op). Detaching here rather than in :meth:`close` is
+        what allows the reaper to revalidate eligibility, claim the close and
+        detach subscribers as one transition -- see :meth:`collect_if_eligible`.
+        """
+        if self._closed:
+            return None
+        self._closed = True
+        self.closed_at = time.time()
+        self.close_reason = reason or "close"
+        subs = list(self._subscribers)
+        self._subscribers.clear()
+        self._stalled_since.clear()
+        return subs
+
+    def _signal_close_sentinels(self, subs) -> int:
+        """Hand the ``None`` end-of-stream sentinel to every detached queue."""
         signalled = 0
         for q in subs:
             try:
@@ -286,6 +303,34 @@ class SessionChannel:
         )
         return signalled
 
+    def collect_if_eligible(self, now: float, reason: str = "reaper") -> bool:
+        """Revalidate eligibility, claim the close and detach subscribers atomically.
+
+        Called by ``_reaper_loop`` with ``SESSION_CHANNELS_LOCK`` held (lock order
+        ``SESSION_CHANNELS_LOCK`` -> ``self._lock``, the order
+        ``subscribe_to_session_channel`` documents). The reaper's registry entry is
+        removed by the caller in the same ``SESSION_CHANNELS_LOCK`` transition.
+
+        Deciding collectability in one lock acquisition and acting on it in
+        another IS the race the review flagged: a stalled subscriber can drain and
+        accept a completion in that gap -- which clears its stall evidence in
+        ``emit()`` -- and the stale decision would still close the channel,
+        evicting the just-delivered event to make room for the sentinel. Because
+        the revalidation runs under the same ``self._lock`` that ``emit()`` uses to
+        clear stall evidence, either the drain lands first (no longer eligible, so
+        nothing is collected) or this claim lands first (subscribers detached, and
+        the later drain is no longer evidence of liveness).
+
+        Returns True when this call collected the channel.
+        """
+        with self._lock:
+            if not self._reaper_should_collect_locked(now):
+                return False
+            subs = self._latch_close_locked(reason)
+        # Sentinels go out with ``self._lock`` released (same shape as ``close``).
+        self._signal_close_sentinels(subs or [])
+        return True
+
     @property
     def closed(self) -> bool:
         """True once :meth:`close` has latched."""
@@ -303,15 +348,19 @@ class SessionChannel:
         of them is still draining (a single live subscriber protects the
         channel, per the Option X contract).
         """
+        with self._lock:
+            return self._dead_subscriber_signal_locked(now)
+
+    def _dead_subscriber_signal_locked(self, now: float) -> bool:
+        """``_dead_subscriber_signal`` body; the caller holds ``self._lock``."""
         from api import config as _cfg
 
-        with self._lock:
-            sub_count = len(self._subscribers)
-            stalled = [
-                self._stalled_since[q]
-                for q in self._subscribers
-                if q in self._stalled_since
-            ]
+        sub_count = len(self._subscribers)
+        stalled = [
+            self._stalled_since[q]
+            for q in self._subscribers
+            if q in self._stalled_since
+        ]
         if sub_count == 0 or len(stalled) != sub_count:
             return False
         window = float(getattr(_cfg, "SESSION_CHANNEL_SUBSCRIBER_STALL_SECS", 300))
@@ -336,13 +385,22 @@ class SessionChannel:
         draining subscriber keeps the channel alive regardless of age. Age is
         not evidence of death; a saturated queue that never drains is.
         """
+        with self._lock:
+            return self._reaper_should_collect_locked(now)
+
+    def _reaper_should_collect_locked(self, now: float) -> bool:
+        """``reaper_should_collect`` body; the caller holds ``self._lock``.
+
+        Split out so :meth:`collect_if_eligible` can revalidate eligibility and
+        claim the close as ONE transition, which is what removes the window the
+        review flagged.
+        """
         from api import config as _cfg
 
-        with self._lock:
-            sub_count = len(self._subscribers)
-            drop_at = self.last_subscriber_drop_at
-            created_at = self.created_at
-            closed = self._closed
+        sub_count = len(self._subscribers)
+        drop_at = self.last_subscriber_drop_at
+        created_at = self.created_at
+        closed = self._closed
 
         if closed:
             # Explicitly closed with subscribers still attached: the reaper has
@@ -352,7 +410,7 @@ class SessionChannel:
             # Live (or at least draining) subscriber — NOT collectible by age.
             # Only a positive dead-subscriber signal may evict it, and the
             # caller must close() first so the handler actually unblocks.
-            return self._dead_subscriber_signal(now)
+            return self._dead_subscriber_signal_locked(now)
         # No subscribers — check grace period.
         grace = float(getattr(_cfg, "SESSION_CHANNEL_SUBSCRIBER_GRACE_SECS", 60))
         if drop_at is not None and (now - drop_at) >= grace:
@@ -593,21 +651,27 @@ def _reaper_loop() -> None:
             collected: list[str] = []
             with SESSION_CHANNELS_LOCK:
                 for sid, ch in list(SESSION_CHANNELS.items()):
-                    if ch.reaper_should_collect(now):
-                        # Explicit-close protocol (#7302):
-                        # signal every still-attached subscriber BEFORE detaching
-                        # the registry entry, otherwise the live SSE handler keeps
-                        # looping on keepalives forever and the tab is stranded on
-                        # an orphan channel. Lock order: SESSION_CHANNELS_LOCK ->
-                        # ch._lock (the order subscribe_to_session_channel already
-                        # documents). close() is idempotent and never raises.
-                        try:
-                            ch.close("reaper")
-                        except Exception:
-                            logger.debug(
-                                "SessionChannel reaper close failed for %s",
-                                sid, exc_info=True,
-                            )
+                    # One atomic transition per channel: revalidate eligibility,
+                    # claim the close and detach subscribers under ch._lock, then
+                    # drop the registry entry -- all inside this same
+                    # SESSION_CHANNELS_LOCK acquisition (explicit-close protocol,
+                    # #7302). Lock order: SESSION_CHANNELS_LOCK -> ch._lock, the
+                    # order subscribe_to_session_channel documents. Deciding
+                    # outside the lock and closing after it is what let a
+                    # subscriber's drain in that gap be overwritten by the
+                    # sentinel. collect_if_eligible() signals every still-attached
+                    # subscriber BEFORE the registry entry is dropped, otherwise
+                    # the live SSE handler keeps looping on keepalives forever and
+                    # the tab is stranded on an orphan channel.
+                    try:
+                        collect = ch.collect_if_eligible(now, "reaper")
+                    except Exception:
+                        logger.debug(
+                            "SessionChannel reaper collect failed for %s",
+                            sid, exc_info=True,
+                        )
+                        collect = False
+                    if collect:
                         SESSION_CHANNELS.pop(sid, None)
                         collected.append(sid)
             if collected:
