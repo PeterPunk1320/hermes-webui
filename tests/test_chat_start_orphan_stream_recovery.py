@@ -398,3 +398,50 @@ def test_orphan_stream_with_a_cancelling_worker_is_not_reaped(monkeypatch, phase
         assert stream_id in config.STREAMS
     finally:
         config.unregister_active_run(stream_id)
+
+
+def test_orphan_clear_releases_every_stream_owned_registry():
+    """Recovering an orphan must not leak the dead turn's per-stream state.
+
+    A crashed or wedged worker never reaches its own teardown, so removing only
+    STREAMS + the owner left the agent instance, cancel flag, partial/reasoning
+    text, live tool calls, goal marker and last event id allocated for the life
+    of the process -- one stale set per recovered orphan. The clear mirrors the
+    canonical worker teardown set (api/streaming.py, api/gateway_chat.py).
+    """
+    _reset_registries()
+    stream_id = "orphan-with-residual-state"
+    session = _Session(active_stream_id=stream_id, session_id="residual-state-session")
+
+    config.STREAMS[stream_id] = queue.Queue()
+    config.AGENT_INSTANCES[stream_id] = object()
+    config.CANCEL_FLAGS[stream_id] = object()
+    config.STREAM_GOAL_RELATED[stream_id] = True
+    config.STREAM_PARTIAL_TEXT[stream_id] = "half a turn"
+    config.STREAM_REASONING_TEXT[stream_id] = "thinking..."
+    config.STREAM_LIVE_TOOL_CALLS[stream_id] = [{"name": "run_shell"}]
+    config.STREAM_LAST_EVENT_ID[stream_id] = "evt-1"
+    config.STREAM_SESSION_OWNERS[stream_id] = session.session_id
+
+    registries = (
+        "STREAMS",
+        "AGENT_INSTANCES",
+        "CANCEL_FLAGS",
+        "STREAM_GOAL_RELATED",
+        "STREAM_PARTIAL_TEXT",
+        "STREAM_REASONING_TEXT",
+        "STREAM_LIVE_TOOL_CALLS",
+        "STREAM_LAST_EVENT_ID",
+    )
+    try:
+        assert routes._active_stream_blocks_chat_start(session, stream_id) is False
+
+        leaked = sorted(
+            name for name in registries if getattr(config, name).get(stream_id) is not None
+        )
+        assert leaked == [], f"orphan recovery left per-stream state allocated: {leaked}"
+        assert stream_id not in config.STREAM_SESSION_OWNERS
+    finally:
+        for name in registries:
+            getattr(config, name).pop(stream_id, None)
+        config.STREAM_SESSION_OWNERS.pop(stream_id, None)

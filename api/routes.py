@@ -23164,12 +23164,29 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
                 return True
             if _pending_turn_in_registration_window(session):
                 return True
-            # Confirmed orphan. STREAMS_LOCK is already held and threading.Lock
-            # is not reentrant, so the entry is removed directly instead of by
-            # re-entering a helper. Lock order stays STREAMS_LOCK ->
-            # STREAM_SESSION_OWNERS_LOCK, the order the rest of the lifecycle
-            # uses (never the reverse).
-            STREAMS.pop(stream_id, None)
+            # Confirmed orphan. Clear the WHOLE stream-owned state, not just the
+            # registry entry: a crashed or wedged worker never reaches its own
+            # teardown, so this stream's agent instance / cancel flag / partial
+            # and reasoning text / live tool calls / goal marker / last event id
+            # would otherwise stay allocated for the life of the process -- one
+            # stale set per recovered orphan. The set and the lock mirror the
+            # canonical teardown (api/streaming.py, api/gateway_chat.py).
+            # STREAMS_LOCK is already held and threading.Lock is not reentrant,
+            # so the entries are removed directly instead of by re-entering a
+            # helper. Lock order stays STREAMS_LOCK -> STREAM_SESSION_OWNERS_LOCK,
+            # the order the rest of the lifecycle uses (never the reverse).
+            from api import config as _live_config
+            for _orphan_registry in (
+                _live_config.AGENT_INSTANCES,
+                _live_config.CANCEL_FLAGS,
+                _live_config.STREAM_GOAL_RELATED,
+                _live_config.STREAM_PARTIAL_TEXT,
+                _live_config.STREAM_REASONING_TEXT,
+                _live_config.STREAM_LIVE_TOOL_CALLS,
+                _live_config.STREAM_LAST_EVENT_ID,
+                _live_config.STREAMS,
+            ):
+                _orphan_registry.pop(stream_id, None)
             try:
                 unregister_stream_owner(stream_id)
             except Exception:
